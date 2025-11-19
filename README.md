@@ -1,6 +1,10 @@
-# 文件管理系统
+# 文件管理系统（双版本：Node + Rust）
 
-一个基于Node.js的独立文件管理系统，提供RESTful API用于文件上传、下载、删除和列出文件等功能。支持储存桶管理、API密钥认证、集群部署和分布式文件存储。
+一个文件管理系统，提供RESTful API用于文件上传、下载、删除和列出文件等功能。支持储存桶管理、API密钥认证、集群部署和分布式文件存储。
+
+本项目同时提供两种实现：
+- 版本 A（Node.js，Express）：位于项目根目录
+- 版本 B（Rust，Axum）：位于 `rust-b/` 目录
 
 ## 功能特性
 
@@ -18,9 +22,17 @@
 
 1. 克隆或下载项目
 
-2. 安装依赖：
+2. 选择实现并安装依赖：
+
+Node 版本 A：
 ```bash
 npm install
+```
+
+Rust 版本 B（需要已安装 Rust 工具链）：
+```bash
+cd rust-b
+cargo build
 ```
 
 3. 创建.env文件：
@@ -39,7 +51,7 @@ REDIS_HOST=localhost
 REDIS_PORT=6379
 REDIS_PASSWORD=
 
-## 运行
+## 运行（Node 版本 A）
 
 ```bash
 # 启动服务器
@@ -50,6 +62,25 @@ npm run dev
 ```
 
 服务器将在 http://localhost:3001 启动
+
+## 运行（Rust 版本 B）
+
+Rust 版默认与 Node 版保持相同的路由语义（无鉴权默认开放）。
+
+```bash
+# 在 rust-b 目录下运行（可按需设置环境变量）
+cd rust-b
+PORT=4002 ROOT_DIR=./storage cargo run
+
+# 示例：创建储存桶
+curl -X POST http://localhost:4002/api/buckets -H 'Content-Type: application/json' -d '{"name":"default"}'
+
+# 示例：上传文件
+curl -F 'file=@./test-upload.txt' http://localhost:4002/api/buckets/default/upload
+
+# 示例：列出文件
+curl http://localhost:4002/api/buckets/default/files
+```
 
 ## API文档
 
@@ -207,14 +238,13 @@ curl -H "X-API-Key: your-api-secret-key" http://localhost:3001/storage/test-buck
 
 ## 技术栈
 
-- Node.js
-- Express.js
-- Multer (文件上传)
-- CORS (跨域支持)
-- Dotenv (环境配置)
-- Redis (集群通信和状态管理)
-- node-cluster (集群支持)
-- 一致性哈希算法 (分布式文件存储)
+**Node 版本 A**
+- Node.js、Express.js、Multer、CORS、Dotenv
+- Redis、node-cluster、一致性哈希算法（分布式文件存储）
+
+**Rust 版本 B**
+- Rust、Axum、Tokio、tower-http（CORS）、dotenvy
+- 本地存储实现，接口与 Node 版一致；可扩展接入 Redis 与多节点
 
 ## 集群部署
 
