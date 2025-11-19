@@ -15,6 +15,9 @@ yarn-error.log*
 storage/
 uploads/
 
+# Rust build artifacts
+rust-b/target/
+
 # IDE
 .idea/
 .vscode/

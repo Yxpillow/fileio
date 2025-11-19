@@ -1,0 +1,20 @@
+[package]
+name = "fileio_b"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.7", features = ["multipart"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "signal"] }
+tower-http = { version = "0.5", features = ["cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dotenvy = "0.15"
+tokio-util = { version = "0.7", features = ["io"] }
+mime = "0.3"
+redis = "0.24"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+chrono = "0.4"
+rand = "0.8"
