@@ -82,6 +82,11 @@ curl -F 'file=@./test-upload.txt' http://localhost:4002/api/buckets/default/uplo
 curl http://localhost:4002/api/buckets/default/files
 ```
 
+可选环境变量：
+- `API_KEY`：设置后启用请求头 `x-api-key` 鉴权
+- `REDIS_HOST`/`REDIS_PORT`/`REDIS_PASSWORD`：启用与 Node 版一致的位置信息写入与重定向
+- `PUBLIC_HOST`：写入到 Redis 的可访问主机名（默认 `localhost`），用于跨节点跳转
+
 ## API文档
 
 ### 认证

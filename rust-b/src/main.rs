@@ -9,6 +9,7 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
+use redis::AsyncCommands;
 use tower_http::cors::{Any, CorsLayer};
 use tokio::fs as tokio_fs;
 use tokio_util::io::ReaderStream;
@@ -18,6 +19,8 @@ use tracing::{info, error};
 struct AppState {
     root_dir: PathBuf,
     api_key: Option<String>,
+    redis_url: Option<String>,
+    public_host: String,
 }
 
 #[derive(Serialize)]
@@ -77,10 +80,12 @@ async fn main() -> anyhow::Result<()> {
     let root_dir = env::var("ROOT_DIR").unwrap_or_else(|_| "./storage".to_string());
     let api_key = env::var("API_KEY").ok().filter(|v| !v.is_empty());
     let port: u16 = env::var("PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(3001);
+    let redis_url = build_redis_url();
+    let public_host = env::var("PUBLIC_HOST").unwrap_or_else(|_| "localhost".to_string());
 
     ensure_dir(Path::new(&root_dir))?;
 
-    let state = AppState { root_dir: PathBuf::from(root_dir), api_key };
+    let state = AppState { root_dir: PathBuf::from(root_dir), api_key, redis_url, public_host };
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -110,6 +115,15 @@ async fn auth_middleware(
     req: axum::http::Request<Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    if let Some(expected) = &state.api_key {
+        if !expected.is_empty() {
+            let headers = req.headers();
+            match headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+                Some(got) if got == expected => {}
+                _ => return (StatusCode::FORBIDDEN, axum::Json(serde_json::json!({"error":"无效的API密钥"}))).into_response(),
+            }
+        }
+    }
     next.run(req).await
 }
 
@@ -230,6 +244,16 @@ async fn upload_file(State(state): State<AppState>, AxPath(bucket): AxPath<Strin
         }
         let size = bytes.len() as u64;
         let resp = UploadFileResp { success: true, file: FileInfo { name: unique.clone(), originalName: original_name, size, path: save_path.to_string_lossy().to_string(), bucket: bucket.clone() } };
+
+        if let Some(url) = &state.redis_url {
+            let key = format!("{}:{}", bucket, unique);
+            let value = serde_json::json!({
+                "id": format!("server-{}", std::process::id()),
+                "host": state.public_host,
+                "port": port_from_env(),
+            }).to_string();
+            let _ = set_redis_key(url, &key, &value).await;
+        }
         return axum::Json(resp).into_response();
     }
     (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error":"没有文件被上传"}))).into_response()
@@ -238,6 +262,17 @@ async fn upload_file(State(state): State<AppState>, AxPath(bucket): AxPath<Strin
 async fn download_file(State(state): State<AppState>, AxPath((bucket, filename)): AxPath<(String, String)>) -> impl IntoResponse {
     let file_path = state.root_dir.join(&bucket).join(&filename);
     if !file_path.exists() { 
+        if let Some(url) = &state.redis_url {
+            let key = format!("{}:{}", bucket, filename);
+            if let Ok(Some(loc)) = get_redis_key(url, &key).await {
+                if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&loc) {
+                    if let (Some(host), Some(port)) = (obj.get("host").and_then(|v| v.as_str()), obj.get("port").and_then(|v| v.as_u64())) {
+                        let target = format!("http://{}:{}/api/buckets/{}/files/{}", host, port, bucket, filename);
+                        return axum::response::Redirect::to(&target).into_response();
+                    }
+                }
+            }
+        }
         return (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"error":"文件不存在"}))).into_response(); 
     }
     match tokio_fs::File::open(&file_path).await {
@@ -261,7 +296,13 @@ async fn delete_file(State(state): State<AppState>, AxPath((bucket, filename)): 
         return (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"error":"文件不存在"}))).into_response(); 
     }
     match fs::remove_file(&file_path) {
-        Ok(_) => axum::Json(serde_json::json!({"message":"文件删除成功"})).into_response(),
+        Ok(_) => {
+            if let Some(url) = &state.redis_url {
+                let key = format!("{}:{}", bucket, filename);
+                let _ = del_redis_key(url, &key).await;
+            }
+            axum::Json(serde_json::json!({"message":"文件删除成功"})).into_response()
+        },
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(serde_json::json!({"error": format!("文件删除失败: {}", e)}))).into_response(),
     }
 }
@@ -270,16 +311,48 @@ async fn file_info(State(state): State<AppState>, AxPath((bucket, filename)): Ax
     let file_path = state.root_dir.join(&bucket).join(&filename);
     match fs::metadata(&file_path) {
         Ok(m) => {
-            axum::Json(serde_json::json!({
+            let mut obj = serde_json::json!({
                 "filename": filename,
                 "size": m.len(),
                 "createdAt": format_time(m.created().ok()),
                 "modifiedAt": format_time(m.modified().ok()),
                 "bucket": bucket,
-            })).into_response()
+            });
+            if let Some(url) = &state.redis_url {
+                let key = format!("{}:{}", bucket, filename);
+                if let Ok(Some(loc)) = get_redis_key(url, &key).await {
+                    obj["location"] = serde_json::from_str::<serde_json::Value>(&loc).unwrap_or(serde_json::Value::Null);
+                }
+            }
+            axum::Json(obj).into_response()
         }
         Err(_) => (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"error":"文件不存在"}))).into_response(),
     }
+}
+
+async fn set_redis_key(url: &str, key: &str, value: &str) -> anyhow::Result<()> {
+    let client = redis::Client::open(url)?;
+    let mut conn = client.get_async_connection().await?;
+    conn.set(key, value).await?;
+    Ok(())
+}
+
+async fn get_redis_key(url: &str, key: &str) -> anyhow::Result<Option<String>> {
+    let client = redis::Client::open(url)?;
+    let mut conn = client.get_async_connection().await?;
+    let res: Option<String> = conn.get(key).await?;
+    Ok(res)
+}
+
+async fn del_redis_key(url: &str, key: &str) -> anyhow::Result<()> {
+    let client = redis::Client::open(url)?;
+    let mut conn = client.get_async_connection().await?;
+    let _: () = conn.del(key).await?;
+    Ok(())
+}
+
+fn port_from_env() -> u16 {
+    env::var("PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(3001)
 }
 
 fn format_time(t: Option<std::time::SystemTime>) -> String {
@@ -293,4 +366,16 @@ fn rand_u32() -> u32 {
     use rand::RngCore; 
     let mut rng = rand::rngs::OsRng; 
     rng.next_u32() 
+}
+fn build_redis_url() -> Option<String> {
+    let host = env::var("REDIS_HOST").ok();
+    let port = env::var("REDIS_PORT").ok();
+    let password = env::var("REDIS_PASSWORD").ok();
+    let h = host.unwrap_or_else(|| "localhost".to_string());
+    let p = port.unwrap_or_else(|| "6379".to_string());
+    if let Some(pass) = password.filter(|v| !v.is_empty()) {
+        Some(format!("redis://:{}@{}:{}/", pass, h, p))
+    } else {
+        Some(format!("redis://{}:{}/", h, p))
+    }
 }
