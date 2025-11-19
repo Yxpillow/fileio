@@ -28,6 +28,8 @@ app.use(express.json());
 
 // 从环境变量获取API密钥
 const API_KEY = process.env.API_KEY;
+// 对外主机名（用于写入Redis供跨节点跳转）
+const PUBLIC_HOST = process.env.PUBLIC_HOST || 'localhost';
 
 // 创建Redis客户端
 const redisClient = redis.createClient({
@@ -107,7 +109,7 @@ const storage = multer.diskStorage({
     // 获取当前服务器信息
     const currentServer = {
       id: `server-${process.pid}`,
-      host: 'localhost',
+      host: PUBLIC_HOST,
       port: process.env.PORT || 3001
     };
     
@@ -305,7 +307,7 @@ app.delete('/api/buckets/:bucket/files/:filename', authenticateApiKey, async (re
       if (fileLocation) {
         const serverInfo = JSON.parse(fileLocation);
         const currentServer = `${serverInfo.host}:${serverInfo.port}`;
-        const thisServer = `localhost:${process.env.PORT || 3001}`;
+        const thisServer = `${PUBLIC_HOST}:${process.env.PORT || 3001}`;
         
         if (currentServer === thisServer) {
           // 文件在当前服务器，执行删除操作
@@ -353,7 +355,7 @@ app.get('/api/buckets/:bucket/files/:filename/info', authenticateApiKey, async (
       if (fileLocation) {
         const serverInfo = JSON.parse(fileLocation);
         const currentServer = `${serverInfo.host}:${serverInfo.port}`;
-        const thisServer = `localhost:${process.env.PORT || 3001}`;
+        const thisServer = `${PUBLIC_HOST}:${process.env.PORT || 3001}`;
         
         if (currentServer === thisServer) {
           // 文件在当前服务器，获取文件信息
