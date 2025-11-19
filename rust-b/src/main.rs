@@ -99,6 +99,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/buckets/:bucket/upload", post(upload_file))
         .route("/api/buckets/:bucket/files/:filename", get(download_file).delete(delete_file))
         .route("/api/buckets/:bucket/files/:filename/info", get(file_info))
+        .route("/api/nodes/register", post(register_node))
+        .route("/api/nodes", get(list_nodes))
+        .route("/health", get(health))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(cors)
         .with_state(state);
@@ -125,6 +128,46 @@ async fn auth_middleware(
         }
     }
     next.run(req).await
+}
+
+#[derive(serde::Deserialize)]
+struct NodeRegisterReq { id: Option<String>, host: Option<String>, port: Option<u16> }
+
+async fn health() -> impl IntoResponse { axum::Json(serde_json::json!({"status":"ok"})) }
+
+async fn register_node(State(state): State<AppState>, payload: Option<axum::Json<NodeRegisterReq>>) -> impl IntoResponse {
+    let id = payload.as_ref().and_then(|p| p.id.clone()).unwrap_or_else(|| format!("server-{}", std::process::id()));
+    let host = payload.as_ref().and_then(|p| p.host.clone()).unwrap_or_else(|| state.public_host.clone());
+    let port = payload.as_ref().and_then(|p| p.port).unwrap_or_else(|| port_from_env());
+    if let Some(url) = &state.redis_url {
+        let node = serde_json::json!({"id": id, "host": host, "port": port}).to_string();
+        let _ = register_node_with_url(url, &node).await;
+    }
+    axum::Json(serde_json::json!({"success": true})).into_response()
+}
+
+async fn list_nodes(State(state): State<AppState>) -> impl IntoResponse {
+    if let Some(url) = &state.redis_url {
+        if let Ok(members) = list_nodes_with_url(url).await {
+            let nodes: Vec<serde_json::Value> = members.into_iter().filter_map(|s| serde_json::from_str(&s).ok()).collect();
+            return axum::Json(serde_json::json!({"nodes": nodes})).into_response();
+        }
+    }
+    axum::Json(serde_json::json!({"nodes": []})).into_response()
+}
+
+async fn register_node_with_url(url: &str, node_json: &str) -> anyhow::Result<()> {
+    let client = redis::Client::open(url.to_string())?;
+    let mut conn = client.get_async_connection().await?;
+    let _: () = redis::AsyncCommands::sadd(&mut conn, "nodes", node_json).await?;
+    Ok(())
+}
+
+async fn list_nodes_with_url(url: &str) -> anyhow::Result<Vec<String>> {
+    let client = redis::Client::open(url.to_string())?;
+    let mut conn = client.get_async_connection().await?;
+    let members: Vec<String> = redis::AsyncCommands::smembers(&mut conn, "nodes").await?;
+    Ok(members)
 }
 
 fn ensure_dir(path: &Path) -> anyhow::Result<()> {
