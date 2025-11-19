@@ -410,6 +410,21 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', message: '文件管理系统正在运行' });
 });
 
+// 集群结构路由（公开）
+app.get('/structure', async (req, res) => {
+  const server = { id: `server-${process.pid}`, host: PUBLIC_HOST, port: PORT };
+  let nodes = [];
+  let redisInfo = { connected: false };
+  try {
+    if (redisClient.isOpen) {
+      redisInfo.connected = true;
+      const members = await redisClient.sMembers('nodes');
+      nodes = members.map(s => { try { return JSON.parse(s); } catch { return null; } }).filter(Boolean);
+    }
+  } catch (e) {}
+  res.json({ server, nodes, redis: redisInfo, config: { servers: clusterConfig.servers } });
+});
+
 // 配置服务器端口
 const PORT = process.env.PORT || 3001;
 
@@ -440,3 +455,27 @@ if (clusterConfig.mode === 'cluster' && cluster.isPrimary) {
     console.log(`进程ID: ${process.pid}`);
   });
 }
+
+// 节点注册与查询
+app.post('/api/nodes/register', authenticateApiKey, async (req, res) => {
+  const info = { id: `server-${process.pid}`, host: PUBLIC_HOST, port: PORT };
+  try {
+    if (redisClient.isOpen) {
+      await redisClient.sAdd('nodes', JSON.stringify(info));
+    }
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: '节点注册失败', details: e.message });
+  }
+});
+
+app.get('/api/nodes', authenticateApiKey, async (req, res) => {
+  try {
+    if (!redisClient.isOpen) return res.json({ nodes: [] });
+    const members = await redisClient.sMembers('nodes');
+    const nodes = members.map(s => { try { return JSON.parse(s); } catch { return null; } }).filter(Boolean);
+    res.json({ nodes });
+  } catch (e) {
+    res.status(500).json({ error: '获取节点失败', details: e.message });
+  }
+});
