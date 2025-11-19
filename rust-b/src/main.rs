@@ -1,4 +1,4 @@
-use std::{env, fs, io, path::{Path, PathBuf}};
+use std::{env, fs, path::{Path, PathBuf}};
 
 use axum::{
     body::Body,
@@ -11,6 +11,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use redis::AsyncCommands;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::trace::TraceLayer;
+use std::time::Duration;
 use tokio::fs as tokio_fs;
 use tokio_util::io::ReaderStream;
 use tracing::{info, error};
@@ -29,7 +31,8 @@ struct BucketInfo {
     size: u64,
     created: String,
     modified: String,
-    fileCount: usize,
+    #[serde(rename = "fileCount")]
+    file_count: usize,
 }
 
 #[derive(Serialize)]
@@ -49,7 +52,8 @@ struct UploadFileResp {
 #[derive(Serialize)]
 struct FileInfo {
     name: String,
-    originalName: String,
+    #[serde(rename = "originalName")]
+    original_name: String,
     size: u64,
     path: String,
     bucket: String,
@@ -92,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    let app = Router::new()
+    let authed = Router::new()
         .route("/api/buckets", get(list_buckets).post(create_bucket))
         .route("/api/buckets/:bucket", delete(delete_bucket))
         .route("/api/buckets/:bucket/files", get(list_files))
@@ -101,15 +105,27 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/buckets/:bucket/files/:filename/info", get(file_info))
         .route("/api/nodes/register", post(register_node))
         .route("/api/nodes", get(list_nodes))
-        .route("/health", get(health))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .with_state(state.clone());
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/health/status", get(health_status))
+        .merge(authed)
         .layer(cors)
+        .layer(TraceLayer::new_for_http())
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", port);
     info!(%addr, "starting fileio-b on");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let _ = heartbeat_task().await;
+    });
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown_rx))
+        .await?;
     Ok(())
 }
 
@@ -135,6 +151,14 @@ struct NodeRegisterReq { id: Option<String>, host: Option<String>, port: Option<
 
 async fn health() -> impl IntoResponse { axum::Json(serde_json::json!({"status":"ok"})) }
 
+async fn health_status(State(state): State<AppState>) -> impl IntoResponse {
+    let redis = match &state.redis_url {
+        Some(url) => match redis_ping(url).await { Ok(true) => serde_json::json!({"connected":true}), Ok(false) => serde_json::json!({"connected":false}), Err(e) => serde_json::json!({"error": e.to_string()}) },
+        None => serde_json::json!({"disabled": true}),
+    };
+    axum::Json(serde_json::json!({"status":"ok","redis":redis})).into_response()
+}
+
 async fn register_node(State(state): State<AppState>, payload: Option<axum::Json<NodeRegisterReq>>) -> impl IntoResponse {
     let id = payload.as_ref().and_then(|p| p.id.clone()).unwrap_or_else(|| format!("server-{}", std::process::id()));
     let host = payload.as_ref().and_then(|p| p.host.clone()).unwrap_or_else(|| state.public_host.clone());
@@ -158,14 +182,14 @@ async fn list_nodes(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn register_node_with_url(url: &str, node_json: &str) -> anyhow::Result<()> {
     let client = redis::Client::open(url.to_string())?;
-    let mut conn = client.get_async_connection().await?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
     let _: () = redis::AsyncCommands::sadd(&mut conn, "nodes", node_json).await?;
     Ok(())
 }
 
 async fn list_nodes_with_url(url: &str) -> anyhow::Result<Vec<String>> {
     let client = redis::Client::open(url.to_string())?;
-    let mut conn = client.get_async_connection().await?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
     let members: Vec<String> = redis::AsyncCommands::smembers(&mut conn, "nodes").await?;
     Ok(members)
 }
@@ -200,7 +224,7 @@ async fn list_buckets(State(state): State<AppState>) -> impl IntoResponse {
                         size,
                         created: format_time(meta.created().ok()),
                         modified: format_time(meta.modified().ok()),
-                        fileCount: file_count,
+                        file_count: file_count,
                     });
                 }
             }
@@ -286,7 +310,7 @@ async fn upload_file(State(state): State<AppState>, AxPath(bucket): AxPath<Strin
             return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(serde_json::json!({"error":"文件保存失败","details":e.to_string()}))).into_response(); 
         }
         let size = bytes.len() as u64;
-        let resp = UploadFileResp { success: true, file: FileInfo { name: unique.clone(), originalName: original_name, size, path: save_path.to_string_lossy().to_string(), bucket: bucket.clone() } };
+        let resp = UploadFileResp { success: true, file: FileInfo { name: unique.clone(), original_name: original_name, size, path: save_path.to_string_lossy().to_string(), bucket: bucket.clone() } };
 
         if let Some(url) = &state.redis_url {
             let key = format!("{}:{}", bucket, unique);
@@ -375,21 +399,21 @@ async fn file_info(State(state): State<AppState>, AxPath((bucket, filename)): Ax
 
 async fn set_redis_key(url: &str, key: &str, value: &str) -> anyhow::Result<()> {
     let client = redis::Client::open(url)?;
-    let mut conn = client.get_async_connection().await?;
-    conn.set(key, value).await?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+    conn.set::<_, _, ()>(key, value).await?;
     Ok(())
 }
 
 async fn get_redis_key(url: &str, key: &str) -> anyhow::Result<Option<String>> {
     let client = redis::Client::open(url)?;
-    let mut conn = client.get_async_connection().await?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
     let res: Option<String> = conn.get(key).await?;
     Ok(res)
 }
 
 async fn del_redis_key(url: &str, key: &str) -> anyhow::Result<()> {
     let client = redis::Client::open(url)?;
-    let mut conn = client.get_async_connection().await?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
     let _: () = conn.del(key).await?;
     Ok(())
 }
@@ -421,4 +445,33 @@ fn build_redis_url() -> Option<String> {
     } else {
         Some(format!("redis://{}:{}/", h, p))
     }
+}
+
+async fn redis_ping(url: &str) -> anyhow::Result<bool> {
+    let client = redis::Client::open(url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+    let res: String = redis::cmd("PING").query_async(&mut conn).await?;
+    Ok(res.to_uppercase() == "PONG")
+}
+
+async fn heartbeat_task() {
+    loop {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        tracing::info!("heartbeat");
+    }
+}
+
+async fn shutdown_signal(mut rx: tokio::sync::oneshot::Receiver<()>) {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::SignalKind;
+        let mut sigterm = tokio::signal::unix::signal(SignalKind::terminate()).expect("sigterm");
+        sigterm.recv().await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! { _ = ctrl_c => {}, _ = terminate => {}, _ = &mut rx => {} }
 }

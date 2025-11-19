@@ -6,13 +6,13 @@ edition = "2021"
 [dependencies]
 axum = { version = "0.7", features = ["multipart"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "signal"] }
-tower-http = { version = "0.5", features = ["cors"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "timeout"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dotenvy = "0.15"
 tokio-util = { version = "0.7", features = ["io"] }
 mime = "0.3"
-redis = "0.24"
+redis = { version = "0.32.7", features = ["tokio-comp"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
