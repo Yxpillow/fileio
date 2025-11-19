@@ -111,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/health/status", get(health_status))
+        .route("/structure", get(structure))
         .merge(authed)
         .layer(cors)
         .layer(TraceLayer::new_for_http())
@@ -157,6 +158,24 @@ async fn health_status(State(state): State<AppState>) -> impl IntoResponse {
         None => serde_json::json!({"disabled": true}),
     };
     axum::Json(serde_json::json!({"status":"ok","redis":redis})).into_response()
+}
+
+async fn structure(State(state): State<AppState>) -> impl IntoResponse {
+    let server = serde_json::json!({
+        "id": format!("server-{}", std::process::id()),
+        "host": state.public_host,
+        "port": port_from_env(),
+    });
+    let mut nodes: Vec<serde_json::Value> = Vec::new();
+    if let Some(url) = &state.redis_url {
+        if let Ok(members) = list_nodes_with_url(url).await {
+            nodes = members.into_iter().filter_map(|s| serde_json::from_str(&s).ok()).collect();
+        }
+    }
+    axum::Json(serde_json::json!({
+        "server": server,
+        "nodes": nodes,
+    })).into_response()
 }
 
 async fn register_node(State(state): State<AppState>, payload: Option<axum::Json<NodeRegisterReq>>) -> impl IntoResponse {
